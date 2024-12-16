@@ -4,6 +4,11 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <cmath>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <algorithm>
 
 // Link with GDI+ library
 #pragma comment(lib, "gdiplus")
@@ -16,6 +21,15 @@
 #define ID_EDIT_ROTATE_RIGHT 1004
 #define ID_VIEW_ACTUAL_SIZE 1005
 #define ID_VIEW_FIT_TO_WINDOW 1006
+#define ID_NAV_PREV 1007
+#define ID_NAV_NEXT 1008
+#define ID_VIEW_DARK_MODE 1009
+
+// Status bar parts
+#define STATUS_PART_DIMENSIONS 0
+#define STATUS_PART_ZOOM 1
+#define STATUS_PART_FILENAME 2
+#define STATUS_PART_FILESIZE 3
 
 // Global variables
 std::unique_ptr<Gdiplus::Bitmap> g_pBitmap;
@@ -27,43 +41,155 @@ ULONG_PTR g_gdiplusToken;
 bool g_fitToWindow = false;
 float g_brightness = 0.0f;
 float g_contrast = 1.0f;
+HWND g_hwndStatus = NULL;
+std::wstring g_currentFile;
+std::vector<std::wstring> g_imageFiles;
+size_t g_currentImageIndex = 0;
+bool g_darkMode = false;
+UINT_PTR g_zoomTimerId = 1;
+bool g_isZooming = false;
+float g_zoomSpeed = 1.1f;
 
 // Function declarations
 void LoadImage(HWND hwnd, LPCWSTR filename);
-void SaveImage(HWND hwnd);
 void UpdateBufferedBitmap(HWND hwnd);
-void StartZoomAnimation(HWND hwnd, float targetZoom);
+void UpdateStatusBar(HWND hwnd);
+bool IsImageFile(const std::wstring& filename);
+void LoadImageDirectory(const std::wstring& currentFile);
+void NavigateImage(HWND hwnd, bool next);
+HMENU CreateMainMenu();
 float LerpZoom(float current, float target, float t);
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
+void StartZoomAnimation(HWND hwnd, float targetZoom);
+void ContinuousZoom(HWND hwnd, bool zoomIn);
+void StopContinuousZoom(HWND hwnd);
+COLORREF GetBackgroundColor();
+COLORREF GetTextColor();
 
-// Function to create menu
-HMENU CreateMainMenu() {
-    HMENU hMenu = CreateMenu();
-    HMENU hFileMenu = CreatePopupMenu();
-    HMENU hEditMenu = CreatePopupMenu();
-    HMENU hViewMenu = CreatePopupMenu();
+COLORREF GetBackgroundColor() {
+    return g_darkMode ? RGB(32, 32, 32) : RGB(255, 255, 255);
+}
 
-    AppendMenuW(hFileMenu, MF_STRING, ID_FILE_OPEN, L"&Open\tCtrl+O");
-    AppendMenuW(hFileMenu, MF_STRING, ID_FILE_SAVE, L"&Save\tCtrl+S");
-    AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hFileMenu, MF_STRING, IDCLOSE, L"E&xit");
+COLORREF GetTextColor() {
+    return g_darkMode ? RGB(240, 240, 240) : RGB(0, 0, 0);
+}
 
-    AppendMenuW(hEditMenu, MF_STRING, ID_EDIT_ROTATE_LEFT, L"Rotate &Left\tCtrl+L");
-    AppendMenuW(hEditMenu, MF_STRING, ID_EDIT_ROTATE_RIGHT, L"Rotate &Right\tCtrl+R");
+float LerpZoom(float current, float target, float t) {
+    return current + (target - current) * t;
+}
 
-    AppendMenuW(hViewMenu, MF_STRING, ID_VIEW_ACTUAL_SIZE, L"&Actual Size\tCtrl+0");
-    AppendMenuW(hViewMenu, MF_STRING, ID_VIEW_FIT_TO_WINDOW, L"&Fit to Window\tCtrl+F");
+void StartZoomAnimation(HWND hwnd, float targetZoom) {
+    g_targetZoom = std::max(0.1f, std::min(5.0f, targetZoom));
+    SetTimer(hwnd, 1, 16, NULL); // ~60 FPS
+}
 
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, L"&File");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEditMenu, L"&Edit");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, L"&View");
+void ContinuousZoom(HWND hwnd, bool zoomIn) {
+    if (!g_isZooming) {
+        g_isZooming = true;
+        SetTimer(hwnd, g_zoomTimerId, 50, NULL);
+    }
+    float zoomFactor = zoomIn ? g_zoomSpeed : 1.0f / g_zoomSpeed;
+    float newZoom = g_targetZoom * zoomFactor;
+    
+    if (newZoom >= 0.1f && newZoom <= 5.0f) {
+        StartZoomAnimation(hwnd, newZoom);
+        UpdateStatusBar(hwnd);
+    }
+}
 
-    return hMenu;
+void StopContinuousZoom(HWND hwnd) {
+    if (g_isZooming) {
+        g_isZooming = false;
+        KillTimer(hwnd, g_zoomTimerId);
+    }
+}
+
+std::wstring FormatFileSize(DWORD size) {
+    const wchar_t* units[] = { L"B", L"KB", L"MB", L"GB" };
+    int unitIndex = 0;
+    double fileSize = static_cast<double>(size);
+    
+    while (fileSize >= 1024 && unitIndex < 3) {
+        fileSize /= 1024;
+        unitIndex++;
+    }
+    
+    std::wstringstream ss;
+    ss << std::fixed << std::setprecision(unitIndex > 0 ? 1 : 0) << fileSize << L" " << units[unitIndex];
+    return ss.str();
+}
+
+void UpdateStatusBar(HWND hwnd) {
+    if (!g_hwndStatus || !g_pBitmap) return;
+
+    // Update dimensions
+    std::wstringstream dimensions;
+    dimensions << g_pBitmap->GetWidth() << L" × " << g_pBitmap->GetHeight() << L" px";
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, STATUS_PART_DIMENSIONS, (LPARAM)dimensions.str().c_str());
+
+    // Update zoom
+    std::wstringstream zoom;
+    zoom << std::fixed << std::setprecision(0) << (g_zoom * 100) << L"%";
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, STATUS_PART_ZOOM, (LPARAM)zoom.str().c_str());
+
+    // Update filename
+    if (!g_currentFile.empty()) {
+        size_t lastSlash = g_currentFile.find_last_of(L'\\');
+        std::wstring filename = lastSlash != std::wstring::npos ? g_currentFile.substr(lastSlash + 1) : g_currentFile;
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, STATUS_PART_FILENAME, (LPARAM)filename.c_str());
+
+        // Update file size
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        if (GetFileAttributesExW(g_currentFile.c_str(), GetFileExInfoStandard, &fileInfo)) {
+            std::wstring fileSize = FormatFileSize(fileInfo.nFileSizeLow);
+            SendMessageW(g_hwndStatus, SB_SETTEXTW, STATUS_PART_FILESIZE, (LPARAM)fileSize.c_str());
+        }
+    }
+}
+
+bool IsImageFile(const std::wstring& filename) {
+    std::wstring ext = filename.substr(filename.find_last_of(L'.'));
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext == L".jpg" || ext == L".jpeg" || ext == L".png" || ext == L".bmp" || ext == L".gif";
+}
+
+void LoadImageDirectory(const std::wstring& currentFile) {
+    g_imageFiles.clear();
+    g_currentImageIndex = 0;
+
+    // Get directory path
+    size_t lastSlash = currentFile.find_last_of(L'\\');
+    if (lastSlash == std::wstring::npos) return;
+    std::wstring dirPath = currentFile.substr(0, lastSlash + 1);
+
+    // Find all image files in directory
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW((dirPath + L"*.*").c_str(), &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::wstring filename = dirPath + findData.cFileName;
+                if (IsImageFile(filename)) {
+                    g_imageFiles.push_back(filename);
+                    if (filename == currentFile) {
+                        g_currentImageIndex = g_imageFiles.size() - 1;
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &findData));
+        FindClose(hFind);
+    }
+
+    // Sort files by name
+    std::sort(g_imageFiles.begin(), g_imageFiles.end());
 }
 
 void LoadImage(HWND hwnd, LPCWSTR filename) {
     g_pBitmap.reset(new Gdiplus::Bitmap(filename));
     if (g_pBitmap->GetLastStatus() == Gdiplus::Ok) {
+        g_currentFile = filename;
+        LoadImageDirectory(filename);
+
         if (g_fitToWindow) {
             RECT clientRect;
             GetClientRect(hwnd, &clientRect);
@@ -78,6 +204,7 @@ void LoadImage(HWND hwnd, LPCWSTR filename) {
             g_targetZoom = g_zoom;
         }
         UpdateBufferedBitmap(hwnd);
+        UpdateStatusBar(hwnd);
         InvalidateRect(hwnd, NULL, TRUE);
     }
 }
@@ -116,49 +243,123 @@ void UpdateBufferedBitmap(HWND hwnd) {
     g_pBufferedBitmap.reset(new Gdiplus::Bitmap(width, height));
     Gdiplus::Graphics graphics(g_pBufferedBitmap.get());
     
-    graphics.Clear(Gdiplus::Color::White);
+    graphics.Clear(Gdiplus::Color(GetBackgroundColor()));
     graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
 
-    // Calculate scaled dimensions
+    // Calculate centered position
     float scaledWidth = g_pBitmap->GetWidth() * g_zoom;
     float scaledHeight = g_pBitmap->GetHeight() * g_zoom;
-    
-    // Center the image
     float x = (width - scaledWidth) / 2;
     float y = (height - scaledHeight) / 2;
 
-    // Set up transformation matrix for rotation
-    Gdiplus::Matrix matrix;
-    matrix.RotateAt(g_rotation, Gdiplus::PointF(x + scaledWidth/2, y + scaledHeight/2));
-    graphics.SetTransform(&matrix);
+    // Set up transformation for rotation
+    graphics.TranslateTransform(width / 2.0f, height / 2.0f);
+    graphics.RotateTransform(g_rotation);
+    graphics.TranslateTransform(-width / 2.0f, -height / 2.0f);
 
-    // Create color matrix for brightness and contrast
+    // Set up color matrix for brightness and contrast
     Gdiplus::ColorMatrix colorMatrix = {
-        g_contrast, 0.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, g_contrast, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, g_contrast, 0.0f, 0.0f,
+        1.0f * g_contrast, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f * g_contrast, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f * g_contrast, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
         g_brightness, g_brightness, g_brightness, 0.0f, 1.0f
     };
 
     Gdiplus::ImageAttributes imageAttr;
-    imageAttr.SetColorMatrix(&colorMatrix);
+    imageAttr.SetColorMatrix(&colorMatrix, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
 
     graphics.DrawImage(g_pBitmap.get(), 
-        Gdiplus::RectF(x, y, scaledWidth, scaledHeight),
-        0, 0, g_pBitmap->GetWidth(), g_pBitmap->GetHeight(),
+        Gdiplus::RectF(x, y, scaledWidth, scaledHeight), 
+        0, 0, g_pBitmap->GetWidth(), g_pBitmap->GetHeight(), 
         Gdiplus::UnitPixel, &imageAttr);
 }
 
-void StartZoomAnimation(HWND hwnd, float targetZoom) {
-    g_targetZoom = targetZoom;
-    SetTimer(hwnd, 1, 16, NULL); // 60 FPS animation
+void OnPaint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    
+    // Create memory DC and bitmap for double buffering
+    HDC memDC = CreateCompatibleDC(hdc);
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    int width = clientRect.right - clientRect.left;
+    int height = clientRect.bottom - clientRect.top;
+    HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+    // Fill background
+    HBRUSH hBrush = CreateSolidBrush(GetBackgroundColor());
+    FillRect(memDC, &clientRect, hBrush);
+    DeleteObject(hBrush);
+
+    if (g_pBufferedBitmap) {
+        Gdiplus::Graphics graphics(memDC);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+        // Calculate centered position
+        float scaledWidth = g_pBufferedBitmap->GetWidth() * g_zoom;
+        float scaledHeight = g_pBufferedBitmap->GetHeight() * g_zoom;
+        float x = (width - scaledWidth) / 2;
+        float y = (height - scaledHeight) / 2;
+
+        graphics.DrawImage(g_pBufferedBitmap.get(), x, y, scaledWidth, scaledHeight);
+    }
+
+    // Copy from memory DC to screen
+    BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
+
+    // Clean up
+    SelectObject(memDC, oldBitmap);
+    DeleteObject(memBitmap);
+    DeleteDC(memDC);
+    EndPaint(hwnd, &ps);
 }
 
-float LerpZoom(float current, float target, float t) {
-    return current + (target - current) * t;
+void NavigateImage(HWND hwnd, bool next) {
+    if (g_imageFiles.empty()) return;
+
+    if (next) {
+        g_currentImageIndex = (g_currentImageIndex + 1) % g_imageFiles.size();
+    } else {
+        g_currentImageIndex = (g_currentImageIndex + g_imageFiles.size() - 1) % g_imageFiles.size();
+    }
+
+    LoadImage(hwnd, g_imageFiles[g_currentImageIndex].c_str());
+}
+
+HMENU CreateMainMenu() {
+    HMENU hMenu = CreateMenu();
+    HMENU hFileMenu = CreatePopupMenu();
+    HMENU hEditMenu = CreatePopupMenu();
+    HMENU hViewMenu = CreatePopupMenu();
+    HMENU hNavMenu = CreatePopupMenu();
+
+    AppendMenuW(hFileMenu, MF_STRING, ID_FILE_OPEN, L"&Open\tCtrl+O");
+    AppendMenuW(hFileMenu, MF_STRING, ID_FILE_SAVE, L"&Save\tCtrl+S");
+    AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hFileMenu, MF_STRING, IDCLOSE, L"E&xit");
+
+    AppendMenuW(hEditMenu, MF_STRING, ID_EDIT_ROTATE_LEFT, L"Rotate &Left\tCtrl+L");
+    AppendMenuW(hEditMenu, MF_STRING, ID_EDIT_ROTATE_RIGHT, L"Rotate &Right\tCtrl+R");
+
+    AppendMenuW(hViewMenu, MF_STRING, ID_VIEW_ACTUAL_SIZE, L"&Actual Size\tCtrl+0");
+    AppendMenuW(hViewMenu, MF_STRING, ID_VIEW_FIT_TO_WINDOW, L"&Fit to Window\tCtrl+F");
+    AppendMenuW(hViewMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hViewMenu, MF_STRING, ID_VIEW_DARK_MODE, L"&Dark Mode\tCtrl+D");
+
+    AppendMenuW(hNavMenu, MF_STRING, ID_NAV_PREV, L"&Previous\tLeft");
+    AppendMenuW(hNavMenu, MF_STRING, ID_NAV_NEXT, L"&Next\tRight");
+
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, L"&File");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEditMenu, L"&Edit");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, L"&View");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNavMenu, L"&Navigate");
+
+    return hMenu;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -170,6 +371,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Enable drag and drop
             DragAcceptFiles(hwnd, TRUE);
             
+            // Create status bar with dark mode support
+            g_hwndStatus = CreateWindowEx(
+                0,
+                STATUSCLASSNAME,
+                NULL,
+                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                0, 0, 0, 0,
+                hwnd,
+                NULL,
+                ((LPCREATESTRUCT)lParam)->hInstance,
+                NULL);
+
+            // Set status bar parts
+            int statusParts[4] = {150, 250, 450, -1};
+            SendMessage(g_hwndStatus, SB_SETPARTS, 4, (LPARAM)statusParts);
+            
             // Set menu
             SetMenu(hwnd, CreateMainMenu());
             return 0;
@@ -177,15 +394,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_PAINT:
         {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
-            
-            if (g_pBufferedBitmap) {
-                Gdiplus::Graphics graphics(hdc);
-                graphics.DrawImage(g_pBufferedBitmap.get(), 0, 0);
-            }
-            
-            EndPaint(hwnd, &ps);
+            OnPaint(hwnd);
             return 0;
         }
 
@@ -221,13 +430,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Limit zoom range
             if (newZoom >= 0.1f && newZoom <= 5.0f) {
                 StartZoomAnimation(hwnd, newZoom);
+                UpdateStatusBar(hwnd);
             }
             return 0;
         }
 
         case WM_KEYDOWN:
         {
-            // Handle keyboard shortcuts
             if (GetKeyState(VK_CONTROL) & 0x8000) {
                 switch (wParam) {
                     case 'O':
@@ -248,7 +457,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     case '0':
                         SendMessage(hwnd, WM_COMMAND, ID_VIEW_ACTUAL_SIZE, 0);
                         return 0;
+                    case 'D':
+                        SendMessage(hwnd, WM_COMMAND, ID_VIEW_DARK_MODE, 0);
+                        return 0;
                 }
+            } else {
+                switch (wParam) {
+                    case VK_LEFT:
+                        SendMessage(hwnd, WM_COMMAND, ID_NAV_PREV, 0);
+                        return 0;
+                    case VK_RIGHT:
+                        SendMessage(hwnd, WM_COMMAND, ID_NAV_NEXT, 0);
+                        return 0;
+                    case VK_UP:
+                        ContinuousZoom(hwnd, true);
+                        return 0;
+                    case VK_DOWN:
+                        ContinuousZoom(hwnd, false);
+                        return 0;
+                }
+            }
+            break;
+        }
+
+        case WM_KEYUP:
+        {
+            switch (wParam) {
+                case VK_UP:
+                case VK_DOWN:
+                    StopContinuousZoom(hwnd);
+                    return 0;
             }
             break;
         }
@@ -314,16 +552,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         }
                     }
                     return 0;
+
+                case ID_NAV_PREV:
+                    NavigateImage(hwnd, false);
+                    return 0;
+
+                case ID_NAV_NEXT:
+                    NavigateImage(hwnd, true);
+                    return 0;
+
+                case ID_VIEW_DARK_MODE:
+                    g_darkMode = !g_darkMode;
+                    CheckMenuItem(GetMenu(hwnd), ID_VIEW_DARK_MODE, 
+                                MF_BYCOMMAND | (g_darkMode ? MF_CHECKED : MF_UNCHECKED));
+                    
+                    // Update status bar colors
+                    SendMessage(g_hwndStatus, SB_SETBKCOLOR, 0, (LPARAM)GetBackgroundColor());
+                    InvalidateRect(g_hwndStatus, NULL, TRUE);
+                    
+                    // Redraw main window
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    return 0;
             }
             break;
         }
 
         case WM_SIZE:
+        {
+            // Resize status bar
+            SendMessage(g_hwndStatus, WM_SIZE, 0, 0);
+
             if (g_pBitmap) {
                 UpdateBufferedBitmap(hwnd);
                 InvalidateRect(hwnd, NULL, TRUE);
             }
             return 0;
+        }
 
         case WM_CLOSE:
             DestroyWindow(hwnd);
@@ -339,7 +603,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-// Helper function to get encoder CLSID
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     UINT num = 0;
     UINT size = 0;
