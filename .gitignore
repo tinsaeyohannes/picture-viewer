@@ -1,0 +1,44 @@
+ # Build output
+dist/
+*.exe
+*.dll
+*.o
+*.obj
+*.out
+
+# IDE specific files
+.vscode/
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+
+# Debug files
+*.pdb
+*.ilk
+*.idb
+*.log
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*~
+*.bak
+*.swp
+
+# Project specific
+build/
+bin/
+obj/
